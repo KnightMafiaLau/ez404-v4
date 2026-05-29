@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-// Deploys EZ404 + EZ404Hook, wires them, initializes the pool at P0, and performs the day-one
-// seed. WIP — drafted against specs/001-ez404-v4-hooks; verify on a fork before any live use.
+// Deploys EZ404 + EZ404Hook, wires them, and initializes the pool at the curve's final price.
+// No day-one seed: the pump.fun curve escrows mint ETH and auto-seeds the locked pool on sell-out
+// (D-13). WIP — drafted against specs/001-ez404-v4-hooks; verify on a fork before any live use.
 //
 // Usage:
-//   POOL_MANAGER=0x... SEED_ETH=1000000000000000000 \
-//   forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast --private-key $PK
+//   POOL_MANAGER=0x... forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast --private-key $PK
 
 import {Script, console2} from "forge-std/Script.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
@@ -31,7 +31,6 @@ contract Deploy is Script {
 
     function run() external {
         address pm = vm.envAddress("POOL_MANAGER");
-        uint256 seedEth = vm.envOr("SEED_ETH", uint256(0));
 
         vm.startBroadcast();
 
@@ -64,20 +63,17 @@ contract Deploy is Script {
         );
         hook.setKey(key);
 
-        // 6) initialize at P0 = unit / mintPrice (no launch arb)
-        uint160 sqrtP0 =
-            uint160(FixedPointMathLib.sqrt(FullMath.mulDiv(token.unit(), 1 << 192, token.pbMintPrice())));
-        IPoolManager(pm).initialize(key, sqrtP0);
-
-        // 7) optional day-one seed
-        if (seedEth > 0) {
-            hook.seedLiquidity{value: seedEth}();
-        }
+        // 6) initialize at the curve's FINAL price so the curve→pool handoff is continuous (D-13).
+        //    No seed here — publicMint escrows ETH and auto-seeds on sell-out (_graduate).
+        (uint256 vTokFinal, uint256 vEthFinal) = token.curveFinalReserves();
+        uint160 sqrtPFinal =
+            uint160(FixedPointMathLib.sqrt(FullMath.mulDiv(vTokFinal, 1 << 192, vEthFinal)));
+        IPoolManager(pm).initialize(key, sqrtPFinal);
 
         vm.stopBroadcast();
 
-        console2.log("EZ404   :", address(token));
+        console2.log("EZ404    :", address(token));
         console2.log("EZ404Hook:", address(hook));
-        console2.log("sqrtP0  :", uint256(sqrtP0));
+        console2.log("sqrtPFinal:", uint256(sqrtPFinal));
     }
 }

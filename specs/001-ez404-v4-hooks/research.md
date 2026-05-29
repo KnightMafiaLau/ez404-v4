@@ -84,3 +84,47 @@ CREATE2 deployer (`0x4e59…4956C`).
 ## D-12 — Whitelist mint dropped
 The original `whitelistMint` had no signature check (`// check signature` only). Rather than ship
 a stub, v1 omits it. Can return later as a signed/Merkle gate behind its own spec.
+
+## D-13 — Pivot: pump.fun curve + flat-per-whole-NFT dividends
+**Supersedes D-3 (no curve), D-5 (coin-age), D-6 (two accumulators), D-8 (seed = mint price);
+refines D-4/D-9.** A long design exploration (whitepaper + degen/NFT framing) converged here.
+
+**(a) Mint via a pump.fun constant-product curve, graduate on sell-out.** Replaces the fixed-price
+`publicMint` + per-mint instant seed.
+- Virtual reserves `x·y = k`; buying Δ tokens costs exactly `y·Δ/(x−Δ)` (the CP integral over a
+  discrete chunk — *exact*, not an approximation, so whole-NFT quantization is clean).
+- Reserves chosen to mirror pump.fun's ratio `vTok0 : sold : remaining = 1.353 : 1 : 0.353`
+  (~14.7× price run), scaled to the 5000-NFT / 50M-token curve:
+  `V_TOK0 = 67.65M`, `V_ETH0 = 6.765 ETH`. First NFT ≈ 0.001 ETH; sell-out raises ≈ 19.2 ETH;
+  final ≈ 0.0147 ETH/NFT.
+- **ETH is escrowed** in the token until sell-out (reverses D-9 Knob-1's per-mint instant seed),
+  then `_graduate()` ships all `ethRaised` to `seedLiquidity` once. `graduated` gate; sell-out is
+  the only trigger (`mintedUnits == MAX_SUPPLY`).
+- **Curve is buy-only** (no sell-back); exit is post-graduation via the AMM. Simpler, no curve-dump.
+- **Seed at the curve's final price.** Pool is `initialize`d at `curveFinalReserves()`
+  (`sqrtP = sqrt(vTokFinal/vEthFinal)·2^96`) so the curve's last fill and the pool's opening spot
+  are continuous (D-8 changes: seed price = curve-end, no longer = a fixed mint price).
+- **Open risk (T065):** a curve that never sells out strands escrowed ETH and never opens trading.
+  v1 has no manual-graduate escape hatch (it would reintroduce a pool-price-vs-curve mismatch).
+  Documented, not mitigated.
+
+**(b) Dividends: flat per whole NFT, dynamic, no snapshot.** Replaces coin-age (D-5/D-6).
+- Weight `weightᵢ = floor(balanceOf(i) / _unit())` = whole NFTs held. `B = Σ weightᵢ`. **Dust below
+  one `_unit()` earns nothing** (a clean "own ≥ 1 NFT to earn" Schelling point).
+- **Single accumulator per currency** (not two): on fee `F`, `acc_c += F·ACC/B`; reward
+  `= weightᵢ·(acc_c − ckᵢ)/ACC`. No `t0`, no `S`, no time term — coin-age and `tStart` deleted.
+- **Eligibility is dynamic and re-entrant:** hold a whole NFT → earn; drop below a unit → that
+  weight decrements (stop earning on it); buy back up → resume. No frozen early-minter snapshot,
+  no permanent disqualification.
+- **Why this shape** (vs. the snapshot/diamond-hand model that was also designed and rejected): the
+  snapshot froze a *closed* club (new buyers could never earn → no "hold for yield" story) and a
+  permanent 1-wei cliff was hostile. "Hold a whole NFT" opens the club to anyone and softens the
+  cliff to the unit boundary. Earliness is rewarded by *cheap curve entry*, not by dividends.
+- **Trade-offs accepted:** (i) dropping coin-age reopens single-fee JIT (buy an NFT, skim one fee,
+  sell) — judged marginal (per-swap skim is tiny, round-trip pays the pool fee twice); a coin-age
+  multiplier can be layered later if it bites. (ii) `skipNFT` contracts holding whole units earn by
+  balance even with `ownedLength == 0`; weight uses `floor(bal/_unit())` (skipNFT-independent),
+  excluded actors are out regardless.
+- **Solvency is now trivial:** one floored accumulator + floored per-holder term ⇒ `Σ ≤ F`, and
+  there is no subtracted term so underflow is impossible. The whole D-6/T028 ceil-vs-floor + clamp
+  apparatus is removed.

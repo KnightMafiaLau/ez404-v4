@@ -1,6 +1,7 @@
 # Data Model & Formulas
 
-State shapes and the math behind the dual-currency coin-age reward ledger.
+State shapes and the math behind (a) the pump.fun-style mint curve and (b) the dual-currency,
+flat-per-whole-NFT reward ledger. See D-13 in `research.md` for the why.
 
 ---
 
@@ -8,27 +9,53 @@ State shapes and the math behind the dual-currency coin-age reward ledger.
 | Name | Value | Meaning |
 |---|---|---|
 | `_unit()` | `10_000e18` | ERC-20 wei per whole NFT |
-| `pbMintPrice` | `0.001 ether` (`1e15`) | ETH per `_unit` minted |
-| `MAX_SUPPLY` | `5000` | max NFT-units mintable via public mint |
-| `P0` | `_unit/pbMintPrice = 1e7` | EZ404 per ETH (raw), launch price |
+| `MAX_SUPPLY` | `5000` | NFT-units sold on the curve |
+| `ACC` | `1 << 96` | fixed-point scale for the reward accumulators |
+| `V_TOK0` | `67_650_000e18` | curve virtual token reserve (67.65M) |
+| `V_ETH0` | `6.765 ether` | curve virtual ETH reserve |
+
+`k = V_TOK0 · V_ETH0` is the constant product. Reserve ratio mirrors pump.fun
+(`vTok0 : sold : remaining = 1.353 : 1 : 0.353`) ⇒ ~14.7× price run start→finish. First NFT
+≈ 0.001 ETH; full sell-out raises ≈ 19.2 ETH; final ≈ 0.0147 ETH/NFT.
+
+## Mint curve (constant product, buy-only)
+Current virtual reserves derive from cumulative state:
+```
+vTok = V_TOK0 − mintedUnits·_unit()      // tokens "left" on the curve
+vETH = V_ETH0 + ethRaised                // ETH taken so far
+```
+Cost to buy `qty` whole NFTs (Δ = `qty·_unit()`), the exact CP integral over the chunk:
+```
+cost = mulDiv(vETH, Δ, vTok − Δ)         // floored ⇒ buyer pays ≤ exact, never over-charged
+```
+`publicMint` escrows `cost`, mints `Δ`, refunds overpay. On `mintedUnits == MAX_SUPPLY` it
+`_graduate()`s: ships all `ethRaised` to the hook's `seedLiquidity` once. Buy-only; no sell-back.
+
+## Graduation seed price
+Pool is `initialize`d (deploy-time) at the curve's deterministic final reserves so the last fill
+and the opening spot are continuous:
+```
+vTokFinal = V_TOK0 − MAX_SUPPLY·_unit()
+vEthFinal = mulDiv(V_ETH0, V_TOK0, vTokFinal)        // = k / vTokFinal
+sqrtP     = sqrt(mulDiv(vTokFinal, 1<<192, vEthFinal))   // token-per-ETH (cur1/cur0), ETH = cur0
+```
+(`curveFinalReserves()` exposes `vTokFinal, vEthFinal`.) Actual `ethRaised` differs from the
+theoretical raise only by floor dust, so any residual arb is sub-wei on the marginal price.
 
 ## Reward-ledger state (EZ404)
 | Symbol | Type | Updated on | Meaning |
 |---|---|---|---|
-| `tStart` | uint256 | ctor | epoch origin; `_now() = block.timestamp − tStart` |
-| `B` | uint256 | balance change | total **eligible** balance (excludes excluded accounts) |
-| `S` | uint256 | balance change | `Σ balᵢ · t0ᵢ` over eligible holders |
-| `t0[u]` | uint256 | receive | holder `u`'s coin-age origin (age resets on receive) |
-| `_eligBal[u]` | uint256 | balance change | tracked eligible balance of `u` |
-| `excluded[u]` | bool | wiring | true ⇒ never accrues, never in `B`/`S` |
-| `accA0,accB0` | uint256 | ETH fee | ETH accumulators |
-| `accA1,accB1` | uint256 | token fee | EZ404 accumulators |
-| `_ckA0/_ckB0/_ckA1/_ckB1[u]` | uint256 | settle | per-holder checkpoints |
+| `B` | uint256 | balance change | total **eligible whole-NFT count** (excludes excluded accounts) |
+| `_weight[u]` | uint256 | balance change | `u`'s eligible whole-NFT count = `floor(bal/_unit())` |
+| `excluded[u]` | bool | wiring | true ⇒ never accrues, never in `B` |
+| `acc0` | uint256 | ETH fee | ETH accumulator |
+| `acc1` | uint256 | token fee | EZ404 accumulator |
+| `_ck0/_ck1[u]` | uint256 | settle | per-holder checkpoints |
 | `claimable0[u]` | uint256 | settle | ETH owed to `u` |
 | `claimable1[u]` | uint256 | settle | EZ404 owed to `u` |
-| `undist0,undist1` | uint256 | accrue | rollover when `W==0` (no eligible weight yet) |
+| `undist0/undist1` | uint256 | accrue | rollover when `B == 0` (no eligible NFTs yet) |
 
-`P` is a fixed-point scale used by `FullMath.mulDiv` to keep precision in the accumulators.
+No `tStart` / `t0` / `S`: dividends carry no time component (coin-age removed, D-13).
 
 ## Hook state (EZ404Hook)
 | Symbol | Meaning |
@@ -39,54 +66,48 @@ State shapes and the math behind the dual-currency coin-age reward ledger.
 | `key`, `tickSpacing` | the single pool |
 | `feeBps` | dividend skim (e.g. 100 = 1%) |
 
-## Coin-age weight
-Total weight at time `t`:
-```
-W(t) = Σ balᵢ · (t − t0ᵢ) = (Σ balᵢ)·t − Σ balᵢ·t0ᵢ = B·t − S
-```
-`B` and `S` change only when a balance changes, so `W(t)` is available in O(1) at any `t`.
-
 ## Distribution (per currency)
-On a fee `F` (currency c) at time `t`, with `F' = F + undist`:
+On a fee `F` (currency c) with `F' = F + undist`:
 ```
-if W == 0 or F' == 0:  undist = F';  return          // no eligible weight yet → roll over
+if B == 0 or F' == 0:  undist = F';  return          // no eligible NFTs yet → roll over
 undist = 0
-accA += mulDiv(F', t·P, W)
-accB += mulDiv(F', P,   W)
+acc += mulDiv(F', ACC, B)                            // split F' evenly across all B NFTs
 ```
 
 ## Settlement (per holder, per currency)
-For holder `u` with eligible balance `b` and origin `t0`:
+For holder `u` with eligible whole-NFT weight `w`:
 ```
-claimable += mulDiv(b,      accA − ckptA, P)        // balance × time term
-           − mulDiv(b·t0,   accB − ckptB, P)        // minus origin term
-ckptA = accA;  ckptB = accB
+claimable += mulDiv(w, acc − ckpt, ACC)
+ckpt = acc
 ```
-Intuition: `b·(accA−ckptA) − b·t0·(accB−ckptB) = b·Σ F·(t−t0)/W = u`'s share of each fee weighted
-by its own coin-age over the interval.
+Intuition: each whole NFT `u` holds earns `(acc − ckpt)/ACC` per unit, i.e. an equal slice of every
+fee accrued since `u` last settled.
 
-## Conservation
-Summing the settlement over all eligible holders for one fee `F'`:
+## Conservation & solvency
+Summing one fee `F'` over all eligible holders:
 ```
-Σ_u [ b_u·(t·P/W) − b_u·t0_u·(P/W) ] / P
-  = (1/W)·[ t·Σ b_u − Σ b_u·t0_u ]·F'
-  = (1/W)·(B·t − S)·F' = (W/W)·F' = F'
+Σ_u floor(w_u · Δacc / ACC)  ≤  (Σ_u w_u)·Δacc/ACC  =  B·Δacc/ACC
+                             =  B·floor(F'·ACC/B)/ACC  ≤  F'
 ```
-So the distributed total equals `F'` exactly in exact arithmetic. In integer math every term uses
-`FullMath.mulDiv` (floor), so the sum is ≤ `F'`: rounding dust stays in the contract, never
-over-pays. **Invariant:** `Σ claimed + Σ claimable + undist + dust == Σ notified`.
+So the distributed total is ≤ `F'` (every term is a floored `FullMath.mulDiv`); rounding dust stays
+in the contract. There is **no subtracted term**, so settlement can never underflow.
+**Invariant:** `Σ claimed + Σ claimable + undist + dust == Σ notified`.
+
+## Eligibility (dynamic, no snapshot)
+- Hold ≥ 1 whole NFT (`floor(bal/_unit()) ≥ 1`) → earning; weight tracks the whole-NFT count.
+- Drop below a unit → that weight decrements (stop earning on the lost NFT); buy back → resume.
+- Dust (`bal mod _unit()`) never earns. Excluded actors (PM/hook/token) are out regardless.
 
 ## Numeric guards (tracked in tasks)
-- `claimable += A − Bterm` must not underflow: prove `A ≥ Bterm` (holds because `t ≥ t0` over the
-  accrual interval; needs care across the checkpoint window).
-- Genesis `W ≈ 0`: route to `undist` until weight is material (D-11).
-- `t0` policy on partial receive: v1 resets age on any receive (simplest, slightly punitive to
-  accumulators); a balance-weighted blend is a documented alternative.
-- All multiplications use `FullMath.mulDiv` with scale `P` to avoid truncation.
+- `ACC = 1<<96` headroom: with `B ≤ ~5000` and realistic per-swap fees, `F·ACC/B` and `w·Δacc/ACC`
+  stay far inside uint256 and lose ≪1 wei to flooring (T063).
+- Curve denominator `vTok − Δ` is always > 0 (Δ ≤ `MAX_SUPPLY·_unit()` < `V_TOK0`).
+- JIT: dropping coin-age reopens single-fee JIT; judged marginal (D-13), revisit if it bites.
 
 ## DN404 integration points
-Every DN404 balance mutator must settle first:
-- `_transfer(from,to,amt)` → settle `from` and `to`, update `B`/`S`/`t0`, then move.
-- `_mint(to,amt)` (public mint, seed) → settle `to`, then mint.
-- `_burn(from,amt)` → settle `from`, then burn.
-- NFT-side ops route through these ERC-20 balance changes; excluded actors (PM/hook) skip accrual.
+Every DN404 balance mutator settles first, then re-syncs whole-NFT weight:
+- `_transfer(from,to,amt)` → settle `from`/`to`, move, `_setWeight(·, bal/_unit())`.
+- `_mint(to,amt)` (curve mint, seed) → settle `to`, mint, re-weight.
+- `_burn(from,amt)` → settle `from`, burn, re-weight.
+- `_transferFromNFT` (mirror `transferFrom`) bypasses `_transfer` → overridden with the same
+  settle/re-weight shape (INV-1). Excluded actors (PM/hook) skip accrual and weight.

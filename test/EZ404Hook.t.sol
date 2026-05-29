@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-// Verifies the four-quadrant fee-currency convention (#1 correctness risk), permanent lock,
-// and seed settlement. WIP — drafted against specs/001-ez404-v4-hooks; not yet run (no Foundry
-// on the authoring machine). CI is the source of truth.
+// Covers: four-quadrant fee-currency convention (#1 correctness risk), permanent lock, seed
+// settlement, INV-1 mirror-NFT weight sync, the flat-per-whole-NFT dividend ACs, and the
+// pump.fun curve + graduation (D-13). CI is the source of truth.
 
 import {Test} from "forge-std/Test.sol";
 import {Deployers} from "v4-core/test/utils/Deployers.sol";
@@ -33,7 +33,7 @@ contract EZ404HookTest is Test, Deployers {
     EZ404Hook hook;
     PoolKey poolKey;
     PoolId id;
-    uint160 sqrtP0;
+    uint160 sqrtPInit;
 
     uint24 constant LP_FEE = 3000;
     int24 constant TS = 60;
@@ -65,17 +65,21 @@ contract EZ404HookTest is Test, Deployers {
         id = poolKey.toId();
         hook.setKey(poolKey);
 
-        // seed price = mint price: P0 = unit / pbMintPrice
-        sqrtP0 = uint160(FixedPointMathLib.sqrt(FullMath.mulDiv(token.unit(), 1 << 192, token.pbMintPrice())));
-        manager.initialize(poolKey, sqrtP0);
+        // seed price = curve FINAL price, so the curve→pool handoff is continuous (D-13).
+        (uint256 vTokFinal, uint256 vEthFinal) = token.curveFinalReserves();
+        sqrtPInit = uint160(FixedPointMathLib.sqrt(FullMath.mulDiv(vTokFinal, 1 << 192, vEthFinal)));
+        manager.initialize(poolKey, sqrtPInit);
 
         vm.deal(controller, 100 ether);
-        hook.seedLiquidity{value: 10 ether}();
+        // NB: setUp does NOT seed or mint — tests that need a live pool call _seedAndStock(); the
+        // curve/graduation tests drive publicMint so they exercise the real seed path.
+    }
 
-        // stock the test contract with EZ404 for "sell" quadrants (bypass publicMint's seed path).
-        // NOTE: hoist unit() out — if inlined as an arg it'd be the call that consumes vm.prank,
-        // leaving mintForSeed un-pranked → OnlyHook().
-        uint256 sellStock = 1_000 * token.unit();
+    // Controller-seeds the locked pool and stocks the test contract with EZ404 for "sell" swaps
+    // (bypasses the curve, which the four-quadrant tests don't need to exercise).
+    function _seedAndStock() internal {
+        hook.seedLiquidity{value: 10 ether}();
+        uint256 sellStock = 1_000 * token.unit(); // hoist unit() out of the pranked call (footgun)
         vm.prank(address(hook));
         token.mintForSeed(address(this), sellStock);
         token.approve(address(swapRouter), type(uint256).max);
@@ -110,25 +114,30 @@ contract EZ404HookTest is Test, Deployers {
     }
 
     function test_Q1_buy_exactIn_feeIn404() public {
+        _seedAndStock();
         _swapAssertFeeCurrency(true, true, -0.01 ether, 0.01 ether);
     }
 
     function test_Q2_sell_exactIn_feeInETH() public {
+        _seedAndStock();
         _swapAssertFeeCurrency(false, true, -int256(token.unit()), 0);
     }
 
     function test_Q3_buy_exactOut_feeInETH() public {
+        _seedAndStock();
         _swapAssertFeeCurrency(true, false, int256(token.unit()), 0.05 ether); // overfund; router refunds
     }
 
     function test_Q4_sell_exactOut_feeIn404() public {
+        _seedAndStock();
         _swapAssertFeeCurrency(false, false, 0.001 ether, 0);
     }
 
     // ── seed / lock ──
-    function test_seed_priceAndLiquidity() public view {
+    function test_seed_priceAndLiquidity() public {
+        _seedAndStock();
         (uint160 sp,,,) = manager.getSlot0(id);
-        assertApproxEqRel(sp, sqrtP0, 1e15); // ≈ P0
+        assertApproxEqRel(sp, sqrtPInit, 1e15); // ≈ curve final price
         assertGt(manager.getLiquidity(id), 0);
         assertGt(token.balanceOf(address(manager)), 0); // pool side minted to PM
     }
@@ -147,11 +156,11 @@ contract EZ404HookTest is Test, Deployers {
         );
     }
 
-    // ── INV-1 regression: coin-age must re-sync on an ERC-721 mirror transfer ──
-    // This is the #1 correctness gap. A mirror `transferFrom` moves _unit() of ERC-20 via
-    // _transferFromNFT, which bypasses _transfer. Without the _transferFromNFT override in EZ404,
-    // bob's coin-age origin (t0) would never be set despite holding a unit → this test fails.
-    function test_NFTtransfer_syncsCoinAge() public {
+    // ── INV-1 regression: whole-NFT weight must re-sync on an ERC-721 mirror transfer ──
+    // A mirror `transferFrom` moves _unit() of ERC-20 via _transferFromNFT, which bypasses
+    // _transfer. Without the _transferFromNFT override in EZ404, bob's weight would never update
+    // despite holding a unit → this test fails.
+    function test_NFTtransfer_syncsWeight() public {
         address alice = makeAddr("alice");
         address bob = makeAddr("bob");
         uint256 u = token.unit();
@@ -160,11 +169,8 @@ contract EZ404HookTest is Test, Deployers {
         vm.prank(address(hook));
         token.mintForSeed(alice, 3 * u);
 
-        // advance so the coin-age origin is distinguishable from genesis (_now() == 0)
-        vm.warp(block.timestamp + 7 days);
-        uint256 ageNow = block.timestamp - token.tStart();
-
-        assertEq(token.t0(bob), 0, "bob has no coin-age origin pre-transfer");
+        assertEq(token.weightOf(alice), 3, "alice has 3 whole-NFT weight");
+        assertEq(token.weightOf(bob), 0, "bob has none pre-transfer");
         uint256 bBefore = token.B();
 
         // move ONE NFT alice -> bob via the mirror. Hoist mirrorERC721() out so it doesn't
@@ -177,10 +183,10 @@ contract EZ404HookTest is Test, Deployers {
         assertEq(token.balanceOf(bob), u, "bob got 1 unit");
         assertEq(token.balanceOf(alice), 2 * u, "alice left with 2 units");
 
-        // THE REGRESSION CHECKS — only pass if _transferFromNFT re-synced coin-age:
-        assertEq(token.t0(bob), ageNow, "bob age reset on receive");
-        assertEq(token.t0(alice), 0, "alice keeps her (genesis) age");
-        assertEq(token.B(), bBefore, "total eligible balance conserved");
+        // THE REGRESSION CHECKS — only pass if _transferFromNFT re-synced weight:
+        assertEq(token.weightOf(bob), 1, "bob weight = 1 NFT");
+        assertEq(token.weightOf(alice), 2, "alice weight = 2 NFTs");
+        assertEq(token.B(), bBefore, "total eligible weight conserved");
     }
 
     // ───────────────────────── reward-ledger AC tests (AC-4/5/6) ─────────────────────────
@@ -191,8 +197,8 @@ contract EZ404HookTest is Test, Deployers {
         token.notifyFeeETH{value: f}();
     }
 
-    // Mint `u` whole units to a holder. skipNFT keeps it ERC-20-only (cheap; the coin-age ledger
-    // tracks ERC-20 balance, not NFTs). Hoist unit() before the prank (the prank footgun).
+    // Mint `u` whole units to a holder. skipNFT keeps it ERC-20-only (cheap; weight is derived from
+    // balance, not NFT possession). Hoist unit() before the prank (the prank footgun).
     function _mintEligible(address who, uint256 u, bool skipNft) internal {
         if (skipNft) {
             vm.prank(who);
@@ -213,12 +219,12 @@ contract EZ404HookTest is Test, Deployers {
     // AC-5: the locked pool and every excluded actor accrue nothing — fees are NOT diluted by the
     // pool's balance (the classic reflection+LP trap this design exists to avoid).
     function test_AC5_excludedAndPoolEarnNothing() public {
-        assertGt(token.balanceOf(address(manager)), 1_000 * token.unit(), "PM holds the pool side");
+        _seedAndStock();
+        assertGt(token.balanceOf(address(manager)), 0, "PM holds the pool side");
 
         token.setExcluded(address(this), true); // make alice the SOLE eligible holder
         address alice = makeAddr("alice");
         _mintEligible(alice, 100, true);
-        vm.warp(block.timestamp + 30 days);
 
         uint256 F = 1 ether;
         _distributeEthFee(F);
@@ -231,17 +237,15 @@ contract EZ404HookTest is Test, Deployers {
         assertEq(token.claimable0(address(token)), 0, "token contract earns 0");
     }
 
-    // AC-4: conservation + coin-age weighting. One fee F across two equal-balance holders of
-    // different age; the older earns more, and the parts sum back to F (rounding against them).
-    function test_AC4_conservationAndAgeWeighting() public {
+    // AC-4: conservation + flat-per-NFT weighting. One fee F across two holders with different
+    // whole-NFT counts; earnings are proportional to NFT count and sum back to F.
+    function test_AC4_conservationFlat() public {
         token.setExcluded(address(this), true);
         address alice = makeAddr("alice");
         address bob = makeAddr("bob");
 
-        _mintEligible(alice, 100, true); // alice age origin = 0
-        vm.warp(block.timestamp + 10 days);
-        _mintEligible(bob, 100, true); // bob age origin = 10d
-        vm.warp(block.timestamp + 20 days); // now: alice 30d, bob 20d
+        _mintEligible(alice, 100, true); // 100 NFTs
+        _mintEligible(bob, 50, true); // 50 NFTs
 
         uint256 F = 1 ether;
         _distributeEthFee(F);
@@ -249,31 +253,111 @@ contract EZ404HookTest is Test, Deployers {
         uint256 a = _claimEth(alice);
         uint256 b = _claimEth(bob);
 
-        assertGt(a, b, "older holder earns more at equal balance");
+        assertGt(a, b, "more NFTs => more reward");
         assertApproxEqAbs(a + b, F, 1e10, "rewards conserve to F");
-        assertApproxEqRel(a, 0.6 ether, 1e15, "alice ~= 30/50 of F");
-        assertApproxEqRel(b, 0.4 ether, 1e15, "bob ~= 20/50 of F");
+        assertApproxEqRel(a, (F * 2) / 3, 1e15, "alice ~= 100/150 of F");
+        assertApproxEqRel(b, F / 3, 1e15, "bob ~= 50/150 of F");
     }
 
-    // AC-6: coin-age defeats JIT. A whale that acquires a huge balance the instant before a fee has
-    // age ~0, so it earns ~0; the aged incumbent keeps ~all of F despite far less balance.
-    function test_AC6_jitEarnsNothing() public {
+    // AC-6: only WHOLE NFTs earn — dust below one _unit() is ignored. Two holders with weight 1
+    // split a fee equally even though one holds 50% more tokens (the extra 0.5 unit is dust).
+    function test_AC6_dustEarnsNothing() public {
         token.setExcluded(address(this), true);
         address alice = makeAddr("alice");
-        address jit = makeAddr("jit");
+        address bob = makeAddr("bob");
+        uint256 u = token.unit();
 
-        _mintEligible(alice, 100, true);
-        vm.warp(block.timestamp + 30 days); // alice ages
-        _mintEligible(jit, 10_000, true); // 100x alice's balance, age 0
+        // alice: 1.5 units → weight 1 (the 0.5 dust must not earn)
+        vm.prank(alice);
+        token.setSkipNFT(true);
+        vm.prank(address(hook));
+        token.mintForSeed(alice, (u * 3) / 2);
+        // bob: 1 unit → weight 1
+        vm.prank(bob);
+        token.setSkipNFT(true);
+        vm.prank(address(hook));
+        token.mintForSeed(bob, u);
+
+        assertEq(token.weightOf(alice), 1, "alice weight 1 (dust ignored)");
+        assertEq(token.weightOf(bob), 1, "bob weight 1");
 
         uint256 F = 1 ether;
-        _distributeEthFee(F); // same timestamp as jit's mint
+        _distributeEthFee(F);
 
-        uint256 aliceGot = _claimEth(alice);
-        uint256 jitGot = _claimEth(jit);
+        uint256 a = _claimEth(alice);
+        uint256 b = _claimEth(bob);
+        assertApproxEqAbs(a, b, 1e9, "equal whole-NFT weight => equal reward despite alice's dust");
+        assertApproxEqAbs(a + b, F, 1e10, "conserve to F");
+    }
 
-        assertLt(jitGot, 1e9, "age-0 whale earns ~nothing"); // teeth: balance-reflection ~0.99F
-        assertApproxEqAbs(aliceGot, F, 1e9, "incumbent keeps ~all of F");
+    // ───────────────────────── pump.fun curve + graduation (D-13) ─────────────────────────
+
+    // First NFT ≈ start price; a 100-NFT chunk costs strictly more than 100× the first (convex).
+    function test_curve_quoteAndConvexity() public view {
+        uint256 first = token.quoteBuy(1);
+        uint256 chunk = token.quoteBuy(100);
+        assertApproxEqRel(first, 0.001 ether, 1e15, "first NFT ~= 0.001 ETH");
+        assertGt(chunk, first * 100, "convex curve: a chunk costs more than N x the first NFT");
+    }
+
+    // Buying advances the curve → the next quote is strictly higher.
+    function test_curve_priceRises() public {
+        address b = makeAddr("buyer");
+        vm.deal(b, 5 ether);
+        vm.prank(b);
+        token.setSkipNFT(true);
+
+        uint256 p0 = token.quoteBuy(1);
+        vm.prank(b);
+        token.publicMint{value: 1 ether}(100); // literal arg → prank not consumed
+        uint256 p1 = token.quoteBuy(1);
+
+        assertGt(p1, p0, "marginal price rises as the curve fills");
+        assertEq(token.mintedUnits(), 100);
+        assertFalse(token.graduated(), "not sold out yet");
+    }
+
+    // Selling out the curve graduates: pool gets seeded with escrowed ETH and dividends turn on.
+    function test_curve_graduation() public {
+        address buyer = makeAddr("buyer");
+        vm.deal(buyer, 30 ether);
+        vm.prank(buyer);
+        token.setSkipNFT(true); // avoid materializing 5000 NFTs; weight is balance-derived
+
+        uint256 maxS = token.MAX_SUPPLY(); // hoist (footgun)
+        assertFalse(token.graduated());
+
+        vm.prank(buyer);
+        token.publicMint{value: 30 ether}(maxS);
+
+        assertTrue(token.graduated(), "sold out -> graduated");
+        assertEq(token.mintedUnits(), maxS);
+        assertGt(manager.getLiquidity(id), 0, "pool seeded at graduation");
+        assertGt(token.balanceOf(address(manager)), 0, "pool holds the token side");
+        assertEq(token.balanceOf(buyer), maxS * token.unit(), "buyer holds all curve NFTs");
+        assertEq(token.weightOf(buyer), maxS, "buyer eligible for full weight");
+
+        // dividends now live: buyer is the sole eligible holder (PM excluded)
+        uint256 F = 1 ether;
+        _distributeEthFee(F);
+        uint256 got = _claimEth(buyer);
+        assertApproxEqAbs(got, F, 1e9, "sole NFT holder collects ~all of F");
+    }
+
+    // After graduation the curve is closed.
+    function test_curve_noMintAfterGraduation() public {
+        address buyer = makeAddr("buyer");
+        vm.deal(buyer, 30 ether);
+        vm.prank(buyer);
+        token.setSkipNFT(true);
+        uint256 maxS = token.MAX_SUPPLY();
+        vm.prank(buyer);
+        token.publicMint{value: 30 ether}(maxS);
+
+        vm.deal(buyer, 1 ether);
+        vm.prank(buyer);
+        vm.expectRevert(EZ404.AlreadyGraduated.selector);
+        token.publicMint{value: 1 ether}(1);
     }
 
     // NOTE: Deployers already provides a non-virtual `receive()`, so we inherit it.
