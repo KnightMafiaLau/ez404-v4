@@ -183,5 +183,98 @@ contract EZ404HookTest is Test, Deployers {
         assertEq(token.B(), bBefore, "total eligible balance conserved");
     }
 
+    // ───────────────────────── reward-ledger AC tests (AC-4/5/6) ─────────────────────────
+    // Inject a fee through the onlyHook intake — the same _accrue path the real _afterSwap uses.
+    function _distributeEthFee(uint256 f) internal {
+        vm.deal(address(hook), address(hook).balance + f);
+        vm.prank(address(hook));
+        token.notifyFeeETH{value: f}();
+    }
+
+    // Mint `u` whole units to a holder. skipNFT keeps it ERC-20-only (cheap; the coin-age ledger
+    // tracks ERC-20 balance, not NFTs). Hoist unit() before the prank (the prank footgun).
+    function _mintEligible(address who, uint256 u, bool skipNft) internal {
+        if (skipNft) {
+            vm.prank(who);
+            token.setSkipNFT(true);
+        }
+        uint256 amt = u * token.unit();
+        vm.prank(address(hook));
+        token.mintForSeed(who, amt);
+    }
+
+    function _claimEth(address who) internal returns (uint256) {
+        uint256 bal = who.balance;
+        vm.prank(who);
+        token.claim();
+        return who.balance - bal;
+    }
+
+    // AC-5: the locked pool and every excluded actor accrue nothing — fees are NOT diluted by the
+    // pool's balance (the classic reflection+LP trap this design exists to avoid).
+    function test_AC5_excludedAndPoolEarnNothing() public {
+        assertGt(token.balanceOf(address(manager)), 1_000 * token.unit(), "PM holds the pool side");
+
+        token.setExcluded(address(this), true); // make alice the SOLE eligible holder
+        address alice = makeAddr("alice");
+        _mintEligible(alice, 100, true);
+        vm.warp(block.timestamp + 30 days);
+
+        uint256 F = 1 ether;
+        _distributeEthFee(F);
+
+        uint256 got = _claimEth(alice);
+        assertApproxEqAbs(got, F, 1e9, "alice collects ~all of F (pool did not dilute)");
+
+        assertEq(token.claimable0(address(manager)), 0, "locked pool earns 0");
+        assertEq(token.claimable0(address(hook)), 0, "hook earns 0");
+        assertEq(token.claimable0(address(token)), 0, "token contract earns 0");
+    }
+
+    // AC-4: conservation + coin-age weighting. One fee F across two equal-balance holders of
+    // different age; the older earns more, and the parts sum back to F (rounding against them).
+    function test_AC4_conservationAndAgeWeighting() public {
+        token.setExcluded(address(this), true);
+        address alice = makeAddr("alice");
+        address bob = makeAddr("bob");
+
+        _mintEligible(alice, 100, true); // alice age origin = 0
+        vm.warp(block.timestamp + 10 days);
+        _mintEligible(bob, 100, true); // bob age origin = 10d
+        vm.warp(block.timestamp + 20 days); // now: alice 30d, bob 20d
+
+        uint256 F = 1 ether;
+        _distributeEthFee(F);
+
+        uint256 a = _claimEth(alice);
+        uint256 b = _claimEth(bob);
+
+        assertGt(a, b, "older holder earns more at equal balance");
+        assertApproxEqAbs(a + b, F, 1e10, "rewards conserve to F");
+        assertApproxEqRel(a, 0.6 ether, 1e15, "alice ~= 30/50 of F");
+        assertApproxEqRel(b, 0.4 ether, 1e15, "bob ~= 20/50 of F");
+    }
+
+    // AC-6: coin-age defeats JIT. A whale that acquires a huge balance the instant before a fee has
+    // age ~0, so it earns ~0; the aged incumbent keeps ~all of F despite far less balance.
+    function test_AC6_jitEarnsNothing() public {
+        token.setExcluded(address(this), true);
+        address alice = makeAddr("alice");
+        address jit = makeAddr("jit");
+
+        _mintEligible(alice, 100, true);
+        vm.warp(block.timestamp + 30 days); // alice ages
+        _mintEligible(jit, 10_000, true); // 100x alice's balance, age 0
+
+        uint256 F = 1 ether;
+        _distributeEthFee(F); // same timestamp as jit's mint
+
+        uint256 aliceGot = _claimEth(alice);
+        uint256 jitGot = _claimEth(jit);
+
+        assertLt(jitGot, 1e9, "age-0 whale earns ~nothing"); // teeth: balance-reflection ~0.99F
+        assertApproxEqAbs(aliceGot, F, 1e9, "incumbent keeps ~all of F");
+    }
+
     // NOTE: Deployers already provides a non-virtual `receive()`, so we inherit it.
 }

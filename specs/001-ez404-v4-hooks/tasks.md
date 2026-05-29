@@ -29,7 +29,11 @@ in a clean checkout). `forge build` is green and the 8-test suite passes.
 - [x] T025 `notifyFeeETH`/`notifyFeeToken`/`claim`/`mintForSeed`
 - [x] T026 `setHook`/`setExcluded` wiring
 - [x] T027 Compile clean (`forge build`)
-- [ ] T028 Prove `A ≥ Bterm` no-underflow; genesis-`W` floor; `t0`-on-receive policy
+- [x] T028 No-underflow + solvency: round AGAINST the claimant — added term (`accA`) floored,
+      subtracted term (`accB`) ceil'd (`mulDivRoundingUp`), then clamp the per-user subtraction to 0.
+      ⇒ computed reward ≤ true reward = `bal·(t−t0)/W·F` ≥ 0, so `Σreward ≤ F` (solvent) and the
+      subtraction can never underflow. Proven by AC-4 (conservation) and AC-6 (age-0 clamps to 0).
+      Still open: genesis-`W` floor (T060) and `t0`-on-receive policy is the deliberate D-6 choice.
 
 ## Phase 3 — Hook (EZ404Hook)
 - [x] T030 `getHookPermissions` (flags 0xA44) + ctor (manager, token, controller, feeBps)
@@ -45,10 +49,14 @@ in a clean checkout). `forge build` is green and the 8-test suite passes.
 - [x] T042 Outsider-add / remove blocked (AC-3)
 - [x] T047 INV-1 regression: coin-age re-syncs on ERC-721 mirror transfer (`_transferFromNFT`);
       verified to fail when the override is neutered
-- [ ] T043 Conservation over transfer/mint/burn/fee sequence (AC-4)
-- [ ] T044 Exclusions earn nothing; locked pool earns nothing (AC-5)
-- [ ] T045 JIT/coin-age: age≈0 earns ≈0 (AC-6)
-- [~] T046 `forge test` green — existing 8-test suite passes; AC-4/5/6 tests (T043–T045) still to add
+- [x] T043 Conservation + age-weighting (AC-4): two equal-balance holders of different age share one
+      fee; older earns more, parts sum back to `F`. Exposed the rounding-insolvency bug (→ T028).
+- [x] T044 Exclusions earn nothing; locked pool earns nothing (AC-5): sole eligible holder collects
+      ~all of `F`; PM/hook/token `claimable0 == 0`. Exposed the exclusion-weight-strand bug.
+- [x] T045 JIT/coin-age (AC-6): age-0 100× whale earns ~0 (clamped), aged incumbent keeps ~all of `F`
+      — distinguishes coin-age from plain balance-reflection.
+- [x] T046 `forge test` green — all 11 tests pass on a real `PoolManager` (4-quadrant + seed + lock +
+      INV-1 NFT-sync + AC-4/5/6).
 
 ## Phase 5 — Deploy
 - [~] T050 `Deploy.s.sol`: EZ404 → HookMiner → `new{salt}` → wire → `initialize@P0` → seed (compiles)
@@ -59,10 +67,12 @@ in a clean checkout). `forge build` is green and the 8-test suite passes.
 - [ ] T060 Genesis low-`W` guard (threshold/vesting) — D-11
 - [ ] T061 `seedLiquidity` spot-price guard (fixed `P0` or deviation band) — D-11
 - [ ] T062 Decide "% of mint ETH to LP" knob default — D-9
-- [ ] T063 Numerics review (FullMath scale `P`, rounding-against-claimant)
+- [~] T063 Numerics review: rounding-against-claimant DONE (T028, enforced + tested). Still open —
+      a broader sweep of FullMath scale `ACC=1<<96` headroom and multi-distribution accumulator drift.
 - [~] T064 DN404 mirror-NFT audit: `_transferFromNFT` override done; PM/hook excluded+skipNFT;
       still TODO — confirm test routers / any other NFT-holding actors are excluded or skipNFT
 
 ## Immediate next
-T043–T045 (conservation, exclusion, JIT/coin-age tests) to finish Phase 4 coverage, then T028/T063
-numerics and a fork dry-run (T051).
+Phase 4 complete (11 tests green; T028 numerics closed). Next: T051 fork deploy dry-run (assert
+`addr & 0x3FFF == 0xA44`), then the Phase 6 econ guards (T060 genesis-`W` floor, T061 seed spot-price
+guard, T062 % -to-LP knob).

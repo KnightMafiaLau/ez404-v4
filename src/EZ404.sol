@@ -116,13 +116,16 @@ contract EZ404 is DN404 {
     function _setExcluded(address a, bool v) internal {
         // settle before flipping so no fees are stranded across the boundary
         _settle(a);
-        excluded[a] = v;
         if (v) {
-            _setSkipNFT(a, true);                         // DN404: contracts hold ERC-20 only
-            // drop out of B/S
+            // Remove a's weight from B/S while it is STILL eligible, THEN mark excluded.
+            // Order matters: _setElig early-returns for excluded addresses, so flipping the flag
+            // first would strand a's (bal·t0) in B/S forever and dilute every future dividend.
             _setElig(a, 0, 0);
+            excluded[a] = true;
+            _setSkipNFT(a, true);                         // DN404: contracts hold ERC-20 only
         } else {
-            _setElig(a, balanceOf(a), _now());
+            excluded[a] = false;
+            _setElig(a, balanceOf(a), _now());            // re-enter B/S at current balance
         }
     }
 
@@ -162,8 +165,10 @@ contract EZ404 is DN404 {
                 return;
             }
             undist0 = 0;
+            // Round AGAINST the claimant so the ledger stays solvent (Σreward ≤ F):
+            // accA is the ADDED term → floor; accB is the SUBTRACTED term → ceil.
             accA0 += FullMath.mulDiv(F, t * ACC, W);
-            accB0 += FullMath.mulDiv(F, ACC, W);
+            accB0 += FullMath.mulDivRoundingUp(F, ACC, W);
         } else {
             uint256 F = amt + undist1;
             if (W == 0 || F == 0) {
@@ -172,7 +177,7 @@ contract EZ404 is DN404 {
             }
             undist1 = 0;
             accA1 += FullMath.mulDiv(F, t * ACC, W);
-            accB1 += FullMath.mulDiv(F, ACC, W);
+            accB1 += FullMath.mulDivRoundingUp(F, ACC, W);
         }
         emit FeeAccrued(isEth, amt);
     }
@@ -205,11 +210,16 @@ contract EZ404 is DN404 {
         uint256 b = _eligBal[u];
         if (b != 0) {
             uint256 bt = b * t0[u];
-            // WIP/T028: prove the A-term ≥ B-term so these subtractions never underflow.
-            claimable0[u] += FullMath.mulDiv(b, accA0 - _ckA0[u], ACC)
-                - FullMath.mulDiv(bt, accB0 - _ckB0[u], ACC);
-            claimable1[u] += FullMath.mulDiv(b, accA1 - _ckA1[u], ACC)
-                - FullMath.mulDiv(bt, accB1 - _ckB1[u], ACC);
+            // T028 closed: reward_i = bal·(t−t0)/W·F ≥ 0 always (t ≥ t0). With accA floored
+            // and accB ceil'd, the ADDED term ≤ true and the SUBTRACTED term ≥ true, so the
+            // computed reward ≤ true reward (⇒ Σreward ≤ F, solvent). The only way the integer
+            // subtraction goes negative is rounding when age≈0 (true reward≈0): clamp to 0.
+            uint256 addA0 = FullMath.mulDiv(b, accA0 - _ckA0[u], ACC);
+            uint256 subB0 = FullMath.mulDivRoundingUp(bt, accB0 - _ckB0[u], ACC);
+            if (addA0 > subB0) claimable0[u] += addA0 - subB0;
+            uint256 addA1 = FullMath.mulDiv(b, accA1 - _ckA1[u], ACC);
+            uint256 subB1 = FullMath.mulDivRoundingUp(bt, accB1 - _ckB1[u], ACC);
+            if (addA1 > subB1) claimable1[u] += addA1 - subB1;
         }
         _ckA0[u] = accA0;
         _ckB0[u] = accB0;
