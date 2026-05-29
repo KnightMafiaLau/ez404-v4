@@ -18,15 +18,19 @@ import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 ///         data-model.md for the math.
 contract EZ404 is DN404 {
     // ─────────────────────────────────────────── constants
-    uint256 public constant MAX_SUPPLY = 5000; // NFT-units sold on the curve
+    // DEMO BUILD (demo/base-sepolia): the whole curve is scaled down 50× from production
+    // (MAX_SUPPLY 5000→100, V_TOK0/V_ETH0 /50) so graduation costs ~0.38 ETH instead of ~19 and is
+    // reachable on a testnet. The price-run SHAPE is identical to production (same ratios/prices);
+    // only the absolute scale changes. DO NOT ship this build to mainnet — see main branch for prod.
+    uint256 public constant MAX_SUPPLY = 100; // NFT-units sold on the curve (prod: 5000)
     uint256 internal constant ACC = 1 << 96; // accumulator fixed-point scale
 
-    // pump.fun-style constant-product virtual reserves (k = V_TOK0 · V_ETH0).
-    // Token axis scaled to a 5000-NFT (50M-token) curve while preserving pump.fun's reserve ratio
+    // pump.fun-style constant-product virtual reserves (k = V_TOK0 · V_ETH0), scaled to a 100-NFT
+    // (1M-token) demo curve while preserving pump.fun's reserve ratio
     // (vTok0 : sold : remaining = 1.353 : 1 : 0.353 ⇒ ~14.7× price run start→finish).
-    // First NFT ≈ 0.001 ETH; full sell-out raises ≈ 19.2 ETH; final ≈ 0.0147 ETH / NFT.
-    uint256 public constant V_TOK0 = 67_650_000e18; // virtual token reserve (67.65M)
-    uint256 public constant V_ETH0 = 6.765 ether; // virtual ETH reserve
+    // First NFT ≈ 0.001 ETH; full sell-out raises ≈ 0.38 ETH; final ≈ 0.0147 ETH / NFT.
+    uint256 public constant V_TOK0 = 1_353_000e18; // virtual token reserve (1.353M; prod: 67.65M)
+    uint256 public constant V_ETH0 = 0.1353 ether; // virtual ETH reserve (prod: 6.765 ether)
 
     string private _name = "EZ404";
     string private _symbol = "EZ";

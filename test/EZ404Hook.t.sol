@@ -296,7 +296,9 @@ contract EZ404HookTest is Test, Deployers {
     function test_curve_quoteAndConvexity() public view {
         uint256 first = token.quoteBuy(1);
         uint256 chunk = token.quoteBuy(100);
-        assertApproxEqRel(first, 0.001 ether, 1e15, "first NFT ~= 0.001 ETH");
+        // DEMO: 1% tolerance — the 100-NFT curve is coarser-grained than prod's 5000, so the first
+        // NFT (a 1/100 chunk) sits ~0.7% above the marginal start price (prod uses 0.1%).
+        assertApproxEqRel(first, 0.001 ether, 1e16, "first NFT ~= 0.001 ETH");
         assertGt(chunk, first * 100, "convex curve: a chunk costs more than N x the first NFT");
     }
 
@@ -309,11 +311,11 @@ contract EZ404HookTest is Test, Deployers {
 
         uint256 p0 = token.quoteBuy(1);
         vm.prank(b);
-        token.publicMint{value: 1 ether}(100); // literal arg → prank not consumed
+        token.publicMint{value: 1 ether}(10); // DEMO: 10 < MAX_SUPPLY(100) so it doesn't sell out
         uint256 p1 = token.quoteBuy(1);
 
         assertGt(p1, p0, "marginal price rises as the curve fills");
-        assertEq(token.mintedUnits(), 100);
+        assertEq(token.mintedUnits(), 10);
         assertFalse(token.graduated(), "not sold out yet");
     }
 
