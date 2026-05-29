@@ -1,0 +1,16 @@
+# Foundry
+/lib/
+/out/
+/cache/
+/broadcast/
+.forge-snapshots/
+
+# Env / secrets
+.env
+.env.*
+*.key
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

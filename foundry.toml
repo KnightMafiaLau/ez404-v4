@@ -1,0 +1,23 @@
+[profile.default]
+src = "src"
+out = "out"
+test = "test"
+script = "script"
+libs = ["lib"]
+solc_version = "0.8.26"
+evm_version = "cancun"          # V4 uses transient storage (tstore/tload)
+optimizer = true
+optimizer_runs = 800
+ffi = true
+bytecode_hash = "none"
+# via_ir may be required if v4-core hits stack-too-deep; flip in T027 if so.
+via_ir = false
+
+[profile.default.fuzz]
+runs = 256
+
+[fmt]
+line_length = 100
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
