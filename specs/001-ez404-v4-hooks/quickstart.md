@@ -8,14 +8,17 @@ foundryup
 ```
 
 ## Install dependencies
-Dependencies are not vendored. From the repo root:
+Dependencies are not vendored. **Pin these exact commits** — `v4-periphery` `main` deleted
+`BaseHook` (PR #510), and DN404 now lives in its own repo (removed from Solady). From the repo root:
 ```bash
-forge install foundry-rs/forge-std
-forge install Uniswap/v4-core
-forge install Uniswap/v4-periphery
-forge install Vectorized/solady
+forge install foundry-rs/forge-std@620536fa5277db4e3fd46772d5cbc1ea0696fb43
+forge install Uniswap/v4-core@59d3ecf53afa9264a16bba0e38f4c5d2231f80bc
+forge install Uniswap/v4-periphery@3779387e5d296f39df543d23524b050f89a62917
+forge install Vectorized/solady@acd959aa4bd04720d640bf4e6a5c71037510cc4b
+forge install Vectorized/dn404@3397cb11558ac853912ee87871422b6a29c9d346
 ```
-`remappings.txt` already points at the resulting `lib/` paths.
+`v4-core`/`v4-periphery` bring `solmate`/`openzeppelin`/`permit2` as nested submodules; `remappings.txt`
+points at those nested `lib/<dep>/lib/...` paths. Tested with Foundry `stable` (forge 1.7.1).
 
 ## Build & test
 ```bash
@@ -27,6 +30,8 @@ Key tests (`test/EZ404Hook.t.sol`):
   `test_Q3_buy_exactOut_feeInETH` / `test_Q4_sell_exactOut_feeIn404` — four-quadrant fee currency.
 - `test_seed_priceAndLiquidity` — pool initialized at `P0`, full-range liquidity present.
 - `test_outsiderAddBlocked` / `test_removeBlocked` — permanent lock.
+- `test_NFTtransfer_syncsCoinAge` — INV-1 regression: coin-age re-syncs on an ERC-721 mirror
+  transfer (the `_transferFromNFT` path that bypasses `_transfer`).
 
 ## Deploy (local fork example)
 ```bash
@@ -38,5 +43,7 @@ CREATE2 deployer → wires `setHook`/`setKey`/exclusions → `initialize(key, sq
 `seedLiquidity{value}`.
 
 ## Status
-Implementation is WIP. See `tasks.md` for what is done and what remains, and CI for the live build
-status. Do not deploy to mainnet until Phase 6 (audit pass) is complete.
+`forge build` is green and all 8 tests pass locally (Foundry 1.7.1). The four-quadrant fee
+convention, permanent lock, seed, and the INV-1 NFT-transfer coin-age sync are verified against a
+real V4 `PoolManager`. Remaining work (numeric guards, deploy dry-run on a fork) is in `tasks.md`.
+Do not deploy to mainnet until Phase 6 (audit pass) is complete.

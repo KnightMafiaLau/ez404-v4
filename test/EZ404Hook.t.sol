@@ -21,6 +21,8 @@ import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {HookMiner} from "v4-periphery/src/utils/HookMiner.sol";
 
+import {DN404Mirror} from "dn404/DN404Mirror.sol";
+
 import {EZ404} from "../src/EZ404.sol";
 import {EZ404Hook, IEZ404Fee} from "../src/EZ404Hook.sol";
 
@@ -70,9 +72,12 @@ contract EZ404HookTest is Test, Deployers {
         vm.deal(controller, 100 ether);
         hook.seedLiquidity{value: 10 ether}();
 
-        // stock the test contract with EZ404 for "sell" quadrants (bypass publicMint's seed path)
+        // stock the test contract with EZ404 for "sell" quadrants (bypass publicMint's seed path).
+        // NOTE: hoist unit() out — if inlined as an arg it'd be the call that consumes vm.prank,
+        // leaving mintForSeed un-pranked → OnlyHook().
+        uint256 sellStock = 1_000 * token.unit();
         vm.prank(address(hook));
-        token.mintForSeed(address(this), 1_000 * token.unit());
+        token.mintForSeed(address(this), sellStock);
         token.approve(address(swapRouter), type(uint256).max);
     }
 
@@ -142,5 +147,41 @@ contract EZ404HookTest is Test, Deployers {
         );
     }
 
-    receive() external payable {} // seed refund / sale proceeds
+    // ── INV-1 regression: coin-age must re-sync on an ERC-721 mirror transfer ──
+    // This is the #1 correctness gap. A mirror `transferFrom` moves _unit() of ERC-20 via
+    // _transferFromNFT, which bypasses _transfer. Without the _transferFromNFT override in EZ404,
+    // bob's coin-age origin (t0) would never be set despite holding a unit → this test fails.
+    function test_NFTtransfer_syncsCoinAge() public {
+        address alice = makeAddr("alice");
+        address bob = makeAddr("bob");
+        uint256 u = token.unit();
+
+        // alice is a fresh EOA (skipNFT=false) so the mint materializes NFTs (ids 1..3)
+        vm.prank(address(hook));
+        token.mintForSeed(alice, 3 * u);
+
+        // advance so the coin-age origin is distinguishable from genesis (_now() == 0)
+        vm.warp(block.timestamp + 7 days);
+        uint256 ageNow = block.timestamp - token.tStart();
+
+        assertEq(token.t0(bob), 0, "bob has no coin-age origin pre-transfer");
+        uint256 bBefore = token.B();
+
+        // move ONE NFT alice -> bob via the mirror. Hoist mirrorERC721() out so it doesn't
+        // consume the prank (the footgun this very test file already tripped on once).
+        address mirror = token.mirrorERC721();
+        vm.prank(alice);
+        DN404Mirror(payable(mirror)).transferFrom(alice, bob, 1);
+
+        // ERC-20 balance followed the NFT
+        assertEq(token.balanceOf(bob), u, "bob got 1 unit");
+        assertEq(token.balanceOf(alice), 2 * u, "alice left with 2 units");
+
+        // THE REGRESSION CHECKS — only pass if _transferFromNFT re-synced coin-age:
+        assertEq(token.t0(bob), ageNow, "bob age reset on receive");
+        assertEq(token.t0(alice), 0, "alice keeps her (genesis) age");
+        assertEq(token.B(), bBefore, "total eligible balance conserved");
+    }
+
+    // NOTE: Deployers already provides a non-virtual `receive()`, so we inherit it.
 }

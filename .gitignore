@@ -14,3 +14,6 @@
 .DS_Store
 .idea/
 .vscode/
+
+# Foundry lockfile (deps pinned explicitly in CI / quickstart)
+foundry.lock

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {DN404} from "solady/tokens/DN404.sol";
-import {DN404Mirror} from "solady/tokens/DN404Mirror.sol";
+import {DN404} from "dn404/DN404.sol";
+import {DN404Mirror} from "dn404/DN404Mirror.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
-import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
+import {LibString} from "solady/utils/LibString.sol";
 import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 
 /// @title EZ404
@@ -97,7 +97,7 @@ contract EZ404 is DN404 {
         return _unit();
     }
 
-    function _tokenURI(uint256 id) internal view override returns (string memory) {
+    function _tokenURI(uint256 id) internal pure override returns (string memory) {
         // WIP: placeholder metadata.
         return string.concat("ez404://", _toString(id));
     }
@@ -249,15 +249,28 @@ contract EZ404 is DN404 {
         _setElig(from, balanceOf(from), t0[from]);
     }
 
-    // WIP/INV-1/T064: NFT transfers via the DN404 mirror adjust ERC-20 balances WITHOUT routing
-    // through _transfer above. _transferFromNFT must be overridden (or balances re-synced) so
-    // coin-age settlement also fires on NFT moves. Tracked as the #1 correctness gap.
-
-    function _toString(uint256 v) internal pure returns (string memory) {
-        return FixedPointMathLib.toString(v);
+    /// @dev INV-1 (#1 correctness gap, closed): an ERC-721 mirror transfer (`transferFrom` on the
+    ///      mirror) moves exactly `_unit()` of ERC-20 balance via `_transferFromNFT`, which does
+    ///      NOT route through `_transfer` above. Without this override, coin-age would never
+    ///      re-sync on NFT moves. Same settle-before / re-elig-after shape as `_transfer`:
+    ///      `_settle` reads the shadow `_eligBal` (not the live balance), so settling after
+    ///      `super` is safe. Sender keeps age, receiver resets (D-6 policy), uniform with `_transfer`.
+    function _transferFromNFT(address from, address to, uint256 id, address msgSender)
+        internal
+        override
+    {
+        _settle(from);
+        _settle(to);
+        super._transferFromNFT(from, to, id, msgSender);
+        _setElig(from, balanceOf(from), t0[from]);        // sender keeps its age
+        _setElig(to, balanceOf(to), _now());              // receiver resets age
     }
 
-    receive() external payable {}                         // claimable ETH funded via notifyFeeETH
+    function _toString(uint256 v) internal pure returns (string memory) {
+        return LibString.toString(v);
+    }
+
+    receive() external payable override {}                // claimable ETH funded via notifyFeeETH
 }
 
 interface IEZ404HookSeed {
